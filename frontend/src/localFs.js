@@ -1,22 +1,23 @@
 /**
- * localFs.js — Penyimpanan lokal berbasis OPFS / File System Access.
+ * localFs.js — Penyimpanan hybrid: OPFS (default zero-click) + File System Access (opsional).
  *
  * Default:
- *   - Gunakan OPFS dan otomatis buat folder app "POS-Offline".
+ *   - OPFS — zero-click, selalu tersedia, tidak perlu izin user.
  *
  * Opsional:
  *   - User bisa pilih folder sendiri via showDirectoryPicker().
- *   - App akan membuat subfolder "POS-Offline" di dalam folder yang dipilih.
+ *   - Folder kustom menggantikan OPFS jika dipilih.
+ *   - Handle folder kustom dipersist di IndexedDB.
  *
- * Catatan:
- *   - Handle folder kustom tidak dipersist permanen tanpa IndexedDB.
- *   - Setelah reload, app kembali ke OPFS sampai user pilih folder lagi.
+ * Semua data disimpan sebagai file JSON di folder "POS-Offline".
  */
 
 const APP_DIR_NAME = 'POS-Offline';
 const API_CACHE_FILE = 'api-cache.json';
 const WRITE_QUEUE_FILE = 'write-queue.json';
-const CUSTOM_FOLDER_PREF_KEY = 'pos-storage-preference';
+const IDB_DB_NAME = 'pos-fs-handle';
+const IDB_STORE_NAME = 'handles';
+const STORAGE_MODE_KEY = 'pos-storage-mode'; // 'opfs' | 'custom'
 
 let customHandle = null;
 const storageListeners = new Set();
@@ -42,37 +43,6 @@ function clearLastStorageError() {
   if (!lastStorageError) return;
   lastStorageError = '';
   notifyStorageListeners();
-}
-
-function getPreferredMode() {
-  try {
-    return localStorage.getItem(CUSTOM_FOLDER_PREF_KEY) || 'opfs';
-  } catch {
-    return 'opfs';
-  }
-}
-
-function setPreferredMode(mode) {
-  try {
-    localStorage.setItem(CUSTOM_FOLDER_PREF_KEY, mode);
-  } catch {
-    // ignore
-  }
-}
-
-async function getOpfsRoot() {
-  try {
-    if (!('storage' in navigator) || typeof navigator.storage.getDirectory !== 'function') {
-      setLastStorageError('OPFS tidak tersedia di environment browser ini.');
-      return null;
-    }
-    const handle = await navigator.storage.getDirectory();
-    clearLastStorageError();
-    return handle;
-  } catch (err) {
-    setLastStorageError(err?.message || 'Gagal mengakses OPFS.');
-    return null;
-  }
 }
 
 async function ensureAppDirectory(rootHandle) {
@@ -109,9 +79,24 @@ async function readJson(handle, filename, fallback = null) {
   }
 }
 
+// ── OPFS (zero-click default) ───────────────────────────────
+
+async function getOpfsAppDir() {
+  try {
+    if (!('storage' in navigator) || typeof navigator.storage.getDirectory !== 'function') {
+      return null;
+    }
+    const root = await navigator.storage.getDirectory();
+    return await ensureAppDirectory(root);
+  } catch {
+    return null;
+  }
+}
+
+// ── Custom folder (File System Access API) ──────────────────
+
 async function getCustomAppDirectory() {
   if (!customHandle) return null;
-
   try {
     const opts = { mode: 'readwrite' };
     let permission = await customHandle.queryPermission(opts);
@@ -120,42 +105,156 @@ async function getCustomAppDirectory() {
     }
     if (permission !== 'granted') {
       customHandle = null;
-      setLastStorageError('Izin folder custom tidak diberikan.');
       return null;
     }
-    const dir = await ensureAppDirectory(customHandle);
-    if (dir) clearLastStorageError();
-    return dir;
-  } catch (err) {
+    return await ensureAppDirectory(customHandle);
+  } catch {
     customHandle = null;
-    setLastStorageError(err?.message || 'Gagal mengakses folder custom.');
     return null;
   }
 }
 
+// ── Resolve: custom folder > OPFS ───────────────────────────
+
 async function resolveHandle() {
+  // 1. Coba folder kustom (jika user sudah pilih)
   const customDir = await getCustomAppDirectory();
   if (customDir) {
-    return { handle: customDir, mode: 'custom', label: `Folder pilihan /${APP_DIR_NAME}` };
+    return { handle: customDir, mode: 'custom', label: `📁 Folder pilihan /${APP_DIR_NAME}` };
   }
 
-  const opfsRoot = await getOpfsRoot();
-  const opfsDir = await ensureAppDirectory(opfsRoot);
-  if (!opfsDir) {
-    return { handle: null, mode: 'unavailable', label: 'Storage offline tidak tersedia' };
+  // 2. Fallback ke OPFS (selalu tersedia, zero-click)
+  const opfsDir = await getOpfsAppDir();
+  if (opfsDir) {
+    return { handle: opfsDir, mode: 'opfs', label: `💾 OPFS /${APP_DIR_NAME}` };
   }
 
-  clearLastStorageError();
-  return { handle: opfsDir, mode: 'opfs', label: `OPFS /${APP_DIR_NAME}` };
+  return { handle: null, mode: 'unavailable', label: 'Storage tidak tersedia' };
 }
 
+// ── IndexedDB: persist directory handle ─────────────────────
+
+function openIdb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(IDB_STORE_NAME);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveHandleToIdb(handle) {
+  try {
+    const db = await openIdb();
+    const tx = db.transaction(IDB_STORE_NAME, 'readwrite');
+    tx.objectStore(IDB_STORE_NAME).put(handle, 'dirHandle');
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  } catch {
+    // IndexedDB tidak tersedia — abaikan
+  }
+}
+
+async function loadHandleFromIdb() {
+  try {
+    const db = await openIdb();
+    const handle = await new Promise((resolve, reject) => {
+      const req = db.transaction(IDB_STORE_NAME, 'readonly')
+        .objectStore(IDB_STORE_NAME)
+        .get('dirHandle');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return handle || null;
+  } catch {
+    return null;
+  }
+}
+
+async function clearHandleFromIdb() {
+  try {
+    const db = await openIdb();
+    const tx = db.transaction(IDB_STORE_NAME, 'readwrite');
+    tx.objectStore(IDB_STORE_NAME).delete('dirHandle');
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  } catch {
+    // abaikan
+  }
+}
+
+// ── Public API ──────────────────────────────────────────────
+
+function getStorageMode() {
+  try { return localStorage.getItem(STORAGE_MODE_KEY) || 'opfs'; } catch { return 'opfs'; }
+}
+
+function setStorageMode(mode) {
+  try { localStorage.setItem(STORAGE_MODE_KEY, mode); } catch {}
+}
+
+/**
+ * Inisialisasi storage (dipanggil saat app start).
+ * OPFS selalu tersedia → selalu return true.
+ * Jika user sebelumnya memilih folder kustom, restore dari IndexedDB.
+ */
+export async function initStorage() {
+  const mode = getStorageMode();
+
+  // Jika user sebelumnya pakai folder kustom, coba restore dari IndexedDB
+  if (mode === 'custom') {
+    const saved = await loadHandleFromIdb();
+    if (saved) {
+      try {
+        const perm = await saved.queryPermission({ mode: 'readwrite' });
+        if (perm === 'granted') {
+          customHandle = saved;
+          await ensureAppDirectory(saved);
+        } else {
+          // Permission expired — fallback ke OPFS
+          setStorageMode('opfs');
+        }
+      } catch {
+        setStorageMode('opfs');
+      }
+    } else {
+      // Handle tidak ditemukan di IndexedDB — fallback ke OPFS
+      setStorageMode('opfs');
+    }
+  }
+
+  const { handle } = await resolveHandle();
+  if (!handle) {
+    setLastStorageError('OPFS tidak tersedia. Gunakan browser Chromium (Chrome/Edge).');
+  } else {
+    clearLastStorageError();
+  }
+
+  notifyStorageListeners();
+  return handle !== null;
+}
+
+/**
+ * Pilih folder kustom via showDirectoryPicker().
+ * Setting disimpan ke localStorage + handle ke IndexedDB —
+ * bertahan meskipun hard refresh.
+ */
 export async function pickFolder() {
   if (!('showDirectoryPicker' in window)) {
     throw new Error('showDirectoryPicker tidak didukung browser ini.');
   }
 
   const handle = await window.showDirectoryPicker({
-    id: 'pos-custom',
+    id: 'pos-storage',
     mode: 'readwrite',
     startIn: 'downloads',
   });
@@ -167,82 +266,84 @@ export async function pickFolder() {
   }
 
   customHandle = handle;
-  setPreferredMode('custom');
   await ensureAppDirectory(handle);
+  await saveHandleToIdb(handle);
+  setStorageMode('custom');
   clearLastStorageError();
   notifyStorageListeners();
 
   return handle;
 }
 
-export async function requestOpfsAccess() {
-  if (!window.isSecureContext) {
-    throw new Error('OPFS butuh secure context. Buka app dari localhost atau HTTPS.');
-  }
-
-  if (!isOpfsSupported()) {
-    throw new Error('OPFS tidak tersedia di environment browser ini.');
-  }
-
-  try {
-    if (navigator.storage && typeof navigator.storage.persist === 'function') {
-      await navigator.storage.persist();
-    }
-
-    const root = await navigator.storage.getDirectory();
-    const appDir = await ensureAppDirectory(root);
-    if (!appDir) {
-      throw new Error(`Gagal membuat folder ${APP_DIR_NAME} di OPFS.`);
-    }
-
-    setPreferredMode('opfs');
-    clearLastStorageError();
-    notifyStorageListeners();
-
-    return {
-      ok: true,
-      label: `OPFS /${APP_DIR_NAME}`,
-    };
-  } catch (err) {
-    setLastStorageError(err?.message || 'Gagal mengaktifkan OPFS.');
-    throw err;
-  }
-}
-
-export function useOpfsStorage() {
+/** Kembali ke OPFS — hapus referensi folder kustom. */
+export async function useOpfsStorage() {
   customHandle = null;
-  setPreferredMode('opfs');
+  await clearHandleFromIdb();
+  setStorageMode('opfs');
   clearLastStorageError();
   notifyStorageListeners();
 }
 
+/** Reset storage. */
+export async function clearStorage() {
+  customHandle = null;
+  await clearHandleFromIdb();
+  setStorageMode('opfs');
+  clearLastStorageError();
+  notifyStorageListeners();
+}
+
+/**
+ * Hapus SEMUA data dari OPFS & folder kustom.
+ * Reset total — seperti pertama kali buka app.
+ */
+export async function deleteAllLocalData() {
+  // Hapus dari folder kustom (jika ada)
+  if (customHandle) {
+    try {
+      await customHandle.removeEntry(APP_DIR_NAME, { recursive: true });
+    } catch { /* abaikan */ }
+  }
+
+  // Hapus dari OPFS
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(APP_DIR_NAME, { recursive: true });
+  } catch { /* abaikan */ }
+
+  await clearStorage();
+  notifyStorageListeners();
+}
+
+/** Cek apakah storage siap. */
 export async function isFolderReady() {
   const { handle } = await resolveHandle();
   return handle !== null;
 }
 
+/** Cek File System Access API support. */
 export function isSupported() {
   return 'showDirectoryPicker' in window;
 }
 
+/** Cek OPFS support. */
 export function isOpfsSupported() {
   return 'storage' in navigator && typeof navigator.storage.getDirectory === 'function';
 }
 
+/** Info status storage. */
 export async function getStorageInfo() {
   const { handle, mode, label } = await resolveHandle();
-  const folderPickerSupported = isSupported();
-  const opfsSupported = isOpfsSupported();
 
   return {
     ready: handle !== null,
     mode,
     label,
-    preferredMode: getPreferredMode(),
+    preferredMode: getStorageMode(),
     customSelected: mode === 'custom',
-    canPickFolder: folderPickerSupported,
-    folderPickerSupported,
-    opfsSupported,
+    canPickFolder: isSupported(),
+    folderPickerSupported: isSupported(),
+    opfsSupported: isOpfsSupported(),
     lastError: lastStorageError,
     isSecureContext: window.isSecureContext,
   };

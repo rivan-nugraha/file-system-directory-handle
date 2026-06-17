@@ -18,6 +18,12 @@ const itemJualSchema = new mongoose.Schema(
 
 const jualSchema = new mongoose.Schema(
   {
+    client_transaction_id: {
+      type: String,
+      unique: true,
+      sparse: true,
+      trim: true,
+    },
     no_transaksi: {
       type: String,
       required: true,

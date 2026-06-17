@@ -1,7 +1,8 @@
 import { NavLink, Outlet } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import api, { onOnlineChange, onQueueChange, setBackendReachable, syncWriteQueue } from '../offlineApi';
-import { getStorageInfo, onStorageChange, pickFolder, requestOpfsAccess, useOpfsStorage } from '../localFs';
+import { subscribeBackendSocket } from '../backendSocket';
+import { getStorageInfo, onStorageChange, pickFolder, initStorage, clearStorage, useOpfsStorage, deleteAllLocalData } from '../localFs';
 
 export default function Layout() {
   const [dbStatus, setDbStatus] = useState(null);
@@ -11,11 +12,9 @@ export default function Layout() {
     ready: false,
     mode: 'loading',
     label: 'Memeriksa storage...',
-    preferredMode: 'opfs',
     customSelected: false,
     canPickFolder: false,
     folderPickerSupported: false,
-    opfsSupported: false,
     lastError: '',
     isSecureContext: true,
   });
@@ -24,6 +23,7 @@ export default function Layout() {
   const [isInstalled, setIsInstalled] = useState(
     window.matchMedia?.('(display-mode: standalone)')?.matches || false
   );
+  const [socketConnected, setSocketConnected] = useState(false);
 
   useEffect(() => {
     const unsub = onOnlineChange(setIsOnline);
@@ -64,7 +64,10 @@ export default function Layout() {
         });
     };
 
-    refreshStorage();
+    // Auto-init storage: OPFS selalu siap (zero-click).
+    // Folder kustom di-restore dari IndexedDB jika ada.
+    initStorage().then(() => refreshStorage());
+
     const unsub = onStorageChange(refreshStorage);
     return unsub;
   }, []);
@@ -75,17 +78,39 @@ export default function Layout() {
   }, []);
 
   useEffect(() => {
+    const unsub = subscribeBackendSocket({
+      onConnect: () => setSocketConnected(true),
+      onDisconnect: () => {
+        setSocketConnected(false);
+        setDbStatus('offline');
+        setBackendReachable(false);
+      },
+      onBackendStatus: (payload) => {
+        setSocketConnected(true);
+        setDbStatus(payload?.database || 'offline');
+        setBackendReachable(payload?.database === 'connected');
+        if (payload?.database === 'connected') {
+          syncWriteQueue();
+        }
+      },
+    });
+
+    return unsub;
+  }, []);
+
+  useEffect(() => {
     if (isOnline) {
       api.get('/health', { _skipLocal: true, noOfflineCache: true, noOfflineFallback: true })
         .then((r) => {
+          const connected = r.data.database === 'connected';
           setDbStatus(r.data.database);
-          setBackendReachable(r.data.database === 'connected');
+          setBackendReachable(connected);
+          if (connected) syncWriteQueue(); // sync SETELAH konfirmasi backend online
         })
         .catch(() => {
           setDbStatus('offline');
           setBackendReachable(false);
         });
-      syncWriteQueue();
     } else {
       setDbStatus('offline');
       setBackendReachable(false);
@@ -101,18 +126,10 @@ export default function Layout() {
     }
   };
 
-  const handleUseOpfs = () => {
-    setStorageError('');
-    useOpfsStorage();
-  };
-
-  const handleActivateOpfs = async () => {
-    setStorageError('');
-    try {
-      await requestOpfsAccess();
-    } catch (err) {
-      setStorageError(err.message || 'Gagal mengaktifkan OPFS.');
-    }
+  const handleDeleteAllData = async () => {
+    if (!confirm('HAPUS SEMUA DATA LOKAL?\n\nData barang, penjualan, pembelian, dan cache akan dihapus permanen.\n\nData di server (MongoDB) tidak terpengaruh.')) return;
+    await deleteAllLocalData();
+    location.reload();
   };
 
   const handleInstallApp = async () => {
@@ -159,51 +176,52 @@ export default function Layout() {
         <div className="folder-section">
           {isInstalled ? (
             <div className="folder-status" style={{ marginBottom: '0.75rem' }}>
-              <span>PWA sudah terpasang</span>
+              <span>✅ PWA sudah terpasang</span>
             </div>
           ) : installPrompt ? (
             <button className="btn btn-primary folder-btn" style={{ marginBottom: '0.75rem' }} onClick={handleInstallApp}>
-              Install App
+              📲 Install App
             </button>
           ) : null}
 
           <button className="btn btn-outline folder-btn" onClick={handlePickFolder}>
-            {storageInfo.customSelected ? 'Ganti Folder' : 'Pilih Folder Download'}
+            {storageInfo.customSelected ? '📁 Ganti Folder' : '📁 Pilih Folder Kustom'}
+          </button>
+
+          {storageInfo.customSelected && (
+            <button className="btn btn-outline folder-btn" style={{ marginTop: '0.4rem' }} onClick={async () => {
+              await useOpfsStorage();
+            }}>
+              💾 Kembali ke OPFS
+            </button>
+          )}
+
+          <button
+            className="btn btn-danger folder-btn"
+            style={{ marginTop: '0.5rem', fontSize: '0.75rem' }}
+            onClick={handleDeleteAllData}
+          >
+            🗑️ Hapus Semua Data Lokal
           </button>
 
           <div className="folder-status" style={{ marginTop: '0.5rem' }}>
-            <span>{storageInfo.label}</span>
+            <span>{storageInfo.ready ? '✅' : '⚠️'} {storageInfo.label}</span>
+            {storageInfo.customSelected && (
+              <span style={{ fontSize: '0.7rem', color: '#64748b', display: 'block', marginTop: '0.15rem' }}>
+                🔒 Disimpan permanen (tahan refresh)
+              </span>
+            )}
           </div>
 
-          <p className="text-muted" style={{ marginTop: '0.5rem', fontSize: '0.75rem' }}>
-            {storageInfo.opfsSupported ? 'OPFS siap dicek' : 'OPFS tidak aktif di browser ini'}
-          </p>
+          {!storageInfo.opfsSupported && !storageInfo.folderPickerSupported && (
+            <p className="text-muted" style={{ marginTop: '0.25rem', fontSize: '0.75rem', color: '#fca5a5' }}>
+              Browser tidak mendukung storage offline.
+            </p>
+          )}
 
           <p className="text-muted" style={{ marginTop: '0.25rem', fontSize: '0.75rem' }}>
-            {storageInfo.folderPickerSupported ? 'Folder picker tersedia' : 'Folder picker tidak tersedia'}
+            {socketConnected ? '🟢 Socket realtime terhubung' : '🔴 Socket realtime terputus'}
           </p>
-
-          {!storageInfo.isSecureContext ? (
-            <p className="text-muted" style={{ marginTop: '0.25rem', fontSize: '0.75rem', color: '#fcd34d' }}>
-              Halaman ini tidak berjalan di secure context, jadi File System API bisa gagal.
-            </p>
-          ) : null}
-
-          <button className="btn btn-outline folder-btn" style={{ marginTop: '0.5rem' }} onClick={handleActivateOpfs}>
-            Aktifkan OPFS
-          </button>
-
-          {storageInfo.mode !== 'opfs' ? (
-            <button className="btn btn-outline folder-btn" style={{ marginTop: '0.5rem' }} onClick={handleUseOpfs}>
-              Pakai OPFS
-            </button>
-          ) : null}
-
-          {storageInfo.preferredMode === 'custom' && !storageInfo.customSelected ? (
-            <p className="text-muted" style={{ marginTop: '0.5rem', fontSize: '0.75rem' }}>
-              Folder custom perlu dipilih ulang setelah reload browser.
-            </p>
-          ) : null}
 
           {storageError ? (
             <p className="text-muted" style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: '#fca5a5' }}>
@@ -213,7 +231,7 @@ export default function Layout() {
 
           {storageInfo.lastError ? (
             <p className="text-muted" style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: '#fca5a5' }}>
-              Cache offline gagal: {storageInfo.lastError}
+              Error: {storageInfo.lastError}
             </p>
           ) : null}
         </div>

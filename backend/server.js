@@ -1,9 +1,12 @@
 require('dotenv').config();
+const http = require('http');
 const express = require('express');
 const cors = require('cors');
 const connectDB = require('./config/db');
+const { initSocket, emitBackendStatus } = require('./socket');
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 8000;
 
 // Middleware
@@ -31,7 +34,9 @@ app.get('/', (req, res) => {
 
 // Start server
 connectDB().then(() => {
-  app.listen(PORT, () => {
+  initSocket(server);
+  server.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    emitBackendStatus();
   });
 });

@@ -8,6 +8,10 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/api': 'http://localhost:8000',
+      '/socket.io': {
+        target: 'http://localhost:8000',
+        ws: true,
+      },
     },
     hmr: {
       protocol: 'ws',

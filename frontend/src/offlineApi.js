@@ -1,9 +1,9 @@
 /**
- * offlineApi.js — Axios instance with offline support berbasis OPFS.
+ * offlineApi.js — Axios instance with offline support berbasis File System Access API.
  *
  * Strategy:
- *   - GET  → local-first (OPFS), fallback network saat online
- *   - POST/PUT/DELETE offline → queue di OPFS → auto-sync saat online
+ *   - GET  → local-first (folder pilihan), fallback network saat online
+ *   - POST/PUT/DELETE offline → queue di folder → auto-sync saat online
  */
 import axios from 'axios';
 import {
@@ -81,7 +81,7 @@ const LOCAL_FS_MAP = {
 
 function matchLocalFs(url) {
   for (const key of Object.keys(LOCAL_FS_MAP)) {
-    if (url === key || url.startsWith(key + '?')) {
+    if (url === key || url.startsWith(key + '?') || url.startsWith(key + '/')) {
       return LOCAL_FS_MAP[key];
     }
   }
@@ -103,6 +103,10 @@ api.interceptors.request.use(async (config) => {
   const mapper = matchLocalFs(config.url);
   if (!mapper) return config;
 
+  // Jika online & backend reachable → network-first (jangan short-circuit ke local)
+  if (isOnline && backendReachable) return config;
+
+  // Offline: coba localFs dulu
   try {
     const localData = await mapper.load();
     if (localData && Array.isArray(localData) && localData.length > 0) {
@@ -257,10 +261,17 @@ export async function syncWriteQueue() {
 
   for (const op of queue) {
     try {
-      await axios({ method: op.method, url: op.url, data: op.data, baseURL: API_BASE });
+      const response = await axios({ method: op.method, url: op.url, data: op.data, baseURL: API_BASE });
+      await reconcileLocalAfterSuccessfulWrite(op.method, op.url, op.data, response.data);
       await removeFromWriteQueue(op.id);
       await notifyQueueListeners();
-    } catch {
+    } catch (err) {
+      const handled = await reconcileQueueFailure(op, err);
+      if (handled) {
+        await removeFromWriteQueue(op.id);
+        await notifyQueueListeners();
+        continue;
+      }
       break;
     }
   }
@@ -295,6 +306,23 @@ const originalPost = api.post.bind(api);
 const originalPut = api.put.bind(api);
 const originalDelete = api.delete.bind(api);
 
+function createClientTransactionId(prefix = 'txn') {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function attachClientTransactionId(url, data) {
+  if (!data || typeof data !== 'object') return data;
+
+  if ((url === '/jual' || url === '/beli') && !data.client_transaction_id) {
+    return {
+      ...data,
+      client_transaction_id: createClientTransactionId(url === '/jual' ? 'jual' : 'beli'),
+    };
+  }
+
+  return data;
+}
+
 function isOfflineOrNetworkError(err) {
   if (!navigator.onLine) return true;
   if (!backendReachable) return true;
@@ -306,16 +334,19 @@ function isOfflineOrNetworkError(err) {
 }
 
 api.post = async function (url, data, config) {
-  await saveToLocalFs('post', url, data);
+  const payload = attachClientTransactionId(url, data);
+  await saveToLocalFs('post', url, payload);
   try {
     if (!isOnline) throw new Error('OFFLINE_QUEUED');
-    return await originalPost(url, data, config);
+    const response = await originalPost(url, payload, config);
+    await reconcileLocalAfterSuccessfulWrite('post', url, payload, response.data);
+    return response;
   } catch (err) {
     if (!isOfflineOrNetworkError(err)) {
       throw err;
     }
 
-    await addToWriteQueue({ method: 'post', url, data: JSON.parse(JSON.stringify(data)) });
+    await addToWriteQueue({ method: 'post', url, data: JSON.parse(JSON.stringify(payload)) });
     await notifyQueueListeners();
     throw new Error('OFFLINE_QUEUED');
   }
@@ -325,7 +356,9 @@ api.put = async function (url, data, config) {
   await saveToLocalFs('put', url, data);
   try {
     if (!isOnline) throw new Error('OFFLINE_QUEUED');
-    return await originalPut(url, data, config);
+    const response = await originalPut(url, data, config);
+    await reconcileLocalAfterSuccessfulWrite('put', url, data, response.data);
+    return response;
   } catch (err) {
     if (!isOfflineOrNetworkError(err)) {
       throw err;
@@ -341,7 +374,9 @@ api.delete = async function (url, config) {
   await removeFromLocalFs(url);
   try {
     if (!isOnline) throw new Error('OFFLINE_QUEUED');
-    return await originalDelete(url, config);
+    const response = await originalDelete(url, config);
+    await reconcileLocalAfterSuccessfulWrite('delete', url, null, response.data);
+    return response;
   } catch (err) {
     if (!isOfflineOrNetworkError(err)) {
       throw err;
@@ -383,13 +418,15 @@ async function saveToLocalFs(method, url, data) {
 
       const total = itemsPopulated.reduce((sum, item) => sum + item.subtotal, 0);
       const localTransaksi = {
-        _id: `local_jual_${Date.now()}`,
+        _id: data.client_transaction_id || `local_jual_${Date.now()}`,
         _local: true,
-        no_transaksi: `OFF-JUL-${Date.now()}`,
+        client_transaction_id: data.client_transaction_id || null,
+        no_transaksi: null,
         tanggal: new Date().toISOString(),
         items: itemsPopulated,
         total,
         keterangan: data.keterangan || '',
+        sync_status: 'pending',
       };
 
       const updatedBarang = barangExisting.map((barang) => {
@@ -423,14 +460,16 @@ async function saveToLocalFs(method, url, data) {
 
       const total = itemsPopulated.reduce((sum, item) => sum + item.subtotal, 0);
       const localTransaksi = {
-        _id: `local_beli_${Date.now()}`,
+        _id: data.client_transaction_id || `local_beli_${Date.now()}`,
         _local: true,
-        no_transaksi: `OFF-BEL-${Date.now()}`,
+        client_transaction_id: data.client_transaction_id || null,
+        no_transaksi: null,
         tanggal: new Date().toISOString(),
         supplier: data.supplier || '',
         items: itemsPopulated,
         total,
         keterangan: data.keterangan || '',
+        sync_status: 'pending',
       };
 
       const updatedBarang = barangExisting.map((barang) => {
@@ -459,6 +498,127 @@ async function saveToLocalFs(method, url, data) {
         await mapper.save(existing);
       }
     }
+  } catch {
+    // ignore
+  }
+}
+
+async function reconcileLocalAfterSuccessfulWrite(method, url, data, serverData) {
+  try {
+    if (method === 'post' && url === '/jual') {
+      const existing = (await loadJual()) || [];
+      const withoutDraft = existing.filter((item) => item.client_transaction_id !== data.client_transaction_id);
+      withoutDraft.unshift({ ...serverData, sync_status: 'synced' });
+      await saveJual(withoutDraft);
+      return;
+    }
+
+    if (method === 'post' && url === '/beli') {
+      const existing = (await loadBeli()) || [];
+      const withoutDraft = existing.filter((item) => item.client_transaction_id !== data.client_transaction_id);
+      withoutDraft.unshift({ ...serverData, sync_status: 'synced' });
+      await saveBeli(withoutDraft);
+      return;
+    }
+
+    if (method === 'post' && url === '/barang') {
+      const existing = (await loadBarang()) || [];
+      const filtered = existing.filter((item) => item._id !== serverData._id && item.kode !== serverData.kode);
+      filtered.unshift(serverData);
+      await saveBarang(filtered);
+      return;
+    }
+
+    // PUT — update item lokal dengan data dari server
+    if (method === 'put') {
+      const mapper = matchLocalFs(url);
+      if (!mapper) return;
+      const existing = (await mapper.load()) || [];
+      const id = extractId(url);
+      if (!id) return;
+      const idx = existing.findIndex((item) => item._id === id);
+      if (idx >= 0) {
+        existing[idx] = { ...existing[idx], ...serverData, _local: false };
+        await mapper.save(existing);
+      }
+      return;
+    }
+
+    // DELETE — hapus dari localFs (mungkin sudah dihapus sebelumnya,
+    // tapi pastikan tidak ada sisa)
+    if (method === 'delete') {
+      await removeFromLocalFs(url);
+      return;
+    }
+  } catch {
+    // ignore local reconcile failures
+  }
+}
+
+async function reconcileQueueFailure(op, err) {
+  const status = err?.response?.status;
+  const errorMessage = err?.response?.data?.error || err?.message || 'Sinkronisasi gagal';
+  const errorCode = err?.response?.data?.code || null;
+
+  const isTerminal = [400, 404, 409].includes(status);
+  if (!isTerminal) return false;
+
+  // Terminal error untuk transaksi
+  if (op.method === 'post' && op.url === '/jual') {
+    await markLocalTransactionStatus('jual', op.data?.client_transaction_id, status === 409 ? 'conflict' : 'rejected', errorMessage, errorCode);
+    await refreshBarangFromServer();
+    return true;
+  }
+
+  if (op.method === 'post' && op.url === '/beli') {
+    await markLocalTransactionStatus('beli', op.data?.client_transaction_id, status === 409 ? 'conflict' : 'rejected', errorMessage, errorCode);
+    await refreshBarangFromServer();
+    return true;
+  }
+
+  // DELETE / PUT — terminal error (404 not found, etc): anggap selesai,
+  // jangan block queue. Refresh data dari server untuk sinkronisasi.
+  if (op.method === 'delete' || op.method === 'put') {
+    await refreshCoreDataFromServer();
+    return true;
+  }
+
+  return false;
+}
+
+async function markLocalTransactionStatus(type, clientTransactionId, syncStatus, syncError, syncErrorCode = null) {
+  if (!clientTransactionId) return;
+
+  try {
+    if (type === 'jual') {
+      const existing = (await loadJual()) || [];
+      const updated = existing.map((item) => (
+        item.client_transaction_id === clientTransactionId
+          ? { ...item, sync_status: syncStatus, sync_error: syncError, sync_error_code: syncErrorCode }
+          : item
+      ));
+      await saveJual(updated);
+      return;
+    }
+
+    if (type === 'beli') {
+      const existing = (await loadBeli()) || [];
+      const updated = existing.map((item) => (
+        item.client_transaction_id === clientTransactionId
+          ? { ...item, sync_status: syncStatus, sync_error: syncError, sync_error_code: syncErrorCode }
+          : item
+      ));
+      await saveBeli(updated);
+    }
+  } catch {
+    // ignore local status reconcile failures
+  }
+}
+
+async function refreshBarangFromServer() {
+  try {
+    const response = await axios.get('/barang', { baseURL: API_BASE, params: { limit: 999 } });
+    await saveBarang(response.data?.data || []);
   } catch {
     // ignore
   }

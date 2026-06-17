@@ -100,14 +100,17 @@ export default function Barang() {
 
   const handleDelete = async (id) => {
     if (!confirm('Hapus barang ini?')) return;
+    // Optimistic delete: hapus dari UI langsung, jangan nunggu network
+    setData((prev) => prev.filter((item) => item._id !== id));
     try {
       await api.delete(`/barang/${id}`);
-      fetchData();
+      fetchData(); // refresh dari server kalau online
     } catch (err) {
       if (err.message?.startsWith('OFFLINE_QUEUED')) {
-        fetchData(); // data sudah dihapus dari localFs, refresh
+        // Sudah dihapus dari localFs & UI, tidak perlu fetch ulang
       } else {
         setError(err.response?.data?.error || err.message);
+        fetchData(); // rollback dari server/local
       }
     }
   };

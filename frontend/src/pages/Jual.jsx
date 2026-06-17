@@ -107,6 +107,8 @@ export default function Jual() {
         setShowForm(false);
         setItems([]);
         setKeterangan('');
+        fetchTransaksi();
+        fetchBarang();
       } else {
         setError(err.response?.data?.error || err.message);
       }
@@ -115,12 +117,20 @@ export default function Jual() {
 
   const handleBatal = async (id) => {
     if (!confirm('Batalkan transaksi ini? Stok akan dikembalikan.')) return;
+    // Optimistic: hapus dari UI langsung
+    setTransaksi((prev) => prev.filter((item) => item._id !== id));
     try {
       await api.delete(`/jual/${id}`);
       fetchTransaksi();
       fetchBarang();
     } catch (err) {
-      setError(err.response?.data?.error || err.message);
+      if (err.message?.startsWith('OFFLINE_QUEUED')) {
+        // Sudah dihapus lokal, tidak perlu fetch ulang
+      } else {
+        setError(err.response?.data?.error || err.message);
+        fetchTransaksi();
+        fetchBarang();
+      }
     }
   };
 
@@ -132,6 +142,21 @@ export default function Jual() {
   const getBarangInfo = (id) => barangList.find((b) => b._id === id);
   const formatRp = (n) => 'Rp ' + Number(n).toLocaleString('id-ID');
   const formatTgl = (d) => new Date(d).toLocaleString('id-ID');
+  const renderSyncMeta = (trx) => {
+    if (trx.sync_status === 'pending') {
+      return 'Pending sinkronisasi';
+    }
+    if (trx.sync_status === 'conflict') {
+      return trx.sync_error || 'Konflik stok saat sinkronisasi';
+    }
+    if (trx.sync_status === 'rejected') {
+      return trx.sync_error || 'Transaksi ditolak backend';
+    }
+    if (trx.sync_status === 'synced') {
+      return 'Sudah sinkron';
+    }
+    return null;
+  };
 
   return (
     <div>
@@ -278,7 +303,14 @@ export default function Jual() {
               ) : (
                 transaksi.map((trx) => (
                   <tr key={trx._id}>
-                    <td><code>{trx.no_transaksi}</code></td>
+                    <td>
+                      <code>{trx.no_transaksi || 'Menunggu Sync'}</code>
+                      {renderSyncMeta(trx) ? (
+                        <div className="text-muted" style={{ fontSize: '0.75rem', marginTop: '0.25rem' }}>
+                          {renderSyncMeta(trx)}
+                        </div>
+                      ) : null}
+                    </td>
                     <td>{formatTgl(trx.tanggal)}</td>
                     <td>
                       {trx.items.map((it, i) => (
@@ -289,7 +321,14 @@ export default function Jual() {
                     </td>
                     <td className="text-right"><strong>{formatRp(trx.total)}</strong></td>
                     <td className="text-center">
-                      <button className="btn btn-sm btn-danger" onClick={() => handleBatal(trx._id)} title="Batalkan">↩️ Batal</button>
+                      <button
+                        className="btn btn-sm btn-danger"
+                        onClick={() => handleBatal(trx._id)}
+                        title="Batalkan"
+                        disabled={trx.sync_status === 'conflict' || trx.sync_status === 'rejected'}
+                      >
+                        ↩️ Batal
+                      </button>
                     </td>
                   </tr>
                 ))

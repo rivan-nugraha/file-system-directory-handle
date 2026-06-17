@@ -3,12 +3,11 @@ import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
 
-// ----- Service Worker: aktif di production dan localhost -----
-const canUsePwa =
-  'serviceWorker' in navigator &&
-  (import.meta.env.PROD || ['localhost', '127.0.0.1'].includes(window.location.hostname));
+// ----- Service Worker: aktif hanya di production -----
+const canUseServiceWorker = 'serviceWorker' in navigator;
+const shouldRegisterServiceWorker = canUseServiceWorker && import.meta.env.PROD;
 
-if (canUsePwa) {
+if (shouldRegisterServiceWorker) {
   window.addEventListener('load', () => {
     navigator.serviceWorker
       .register('/sw.js')
@@ -26,12 +25,11 @@ if (canUsePwa) {
       .catch((err) => {
         console.warn('[SW] Registration failed:', err);
       });
-
-    let refreshing = false;
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (refreshing) return;
-      refreshing = true;
-      window.location.reload();
+  });
+} else if (canUseServiceWorker) {
+  navigator.serviceWorker.getRegistrations().then((registrations) => {
+    registrations.forEach((registration) => {
+      registration.unregister();
     });
   });
 }

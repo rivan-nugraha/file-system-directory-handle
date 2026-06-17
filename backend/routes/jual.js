@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Jual = require('../models/Jual');
 const Barang = require('../models/Barang');
+const { emitSyncEvent, emitBackendStatus } = require('../socket');
 
 // Helper: generate nomor transaksi
 const genNoTransaksi = (prefix = 'JUL') => {
@@ -51,25 +52,27 @@ router.get('/:id', async (req, res) => {
 // POST /api/jual — buat transaksi penjualan
 router.post('/', async (req, res) => {
   try {
-    const { items, keterangan } = req.body;
+    const { items, keterangan, client_transaction_id } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'Minimal 1 item' });
     }
 
+    if (client_transaction_id) {
+      const existing = await Jual.findOne({ client_transaction_id });
+      if (existing) {
+        return res.status(200).json(existing);
+      }
+    }
+
     let total = 0;
     const itemsPopulated = [];
+    const appliedStockUpdates = [];
 
-    // Validasi stok & hitung subtotal
     for (const item of items) {
       const barang = await Barang.findById(item.barang);
       if (!barang) {
         return res.status(404).json({ error: `Barang ID ${item.barang} tidak ditemukan` });
-      }
-      if (barang.stok < item.qty) {
-        return res.status(400).json({
-          error: `Stok ${barang.nama} tidak cukup (tersedia: ${barang.stok})`,
-        });
       }
 
       const subtotal = item.qty * barang.harga_jual;
@@ -85,26 +88,64 @@ router.post('/', async (req, res) => {
       });
     }
 
-    // Kurangi stok
     for (const item of itemsPopulated) {
-      await Barang.findByIdAndUpdate(item.barang, {
-        $inc: { stok: -item.qty },
-      });
+      const updatedBarang = await Barang.findOneAndUpdate(
+        { _id: item.barang, stok: { $gte: item.qty } },
+        { $inc: { stok: -item.qty } },
+        { new: true }
+      );
+
+      if (!updatedBarang) {
+        for (const applied of appliedStockUpdates) {
+          await Barang.findByIdAndUpdate(applied.barang, {
+            $inc: { stok: applied.qty },
+          });
+        }
+
+        return res.status(409).json({
+          error: `Stok ${item.nama} tidak cukup saat sinkronisasi`,
+          code: 'STOCK_CONFLICT',
+          barang_id: item.barang,
+        });
+      }
+
+      appliedStockUpdates.push({ barang: item.barang, qty: item.qty });
     }
 
-    const jual = await Jual.create({
-      no_transaksi: genNoTransaksi('JUL'),
-      items: itemsPopulated,
-      total,
-      keterangan,
+    let jual;
+
+    try {
+      jual = await Jual.create({
+        client_transaction_id: client_transaction_id || undefined,
+        no_transaksi: genNoTransaksi('JUL'),
+        items: itemsPopulated,
+        total,
+        keterangan,
+      });
+    } catch (err) {
+      for (const applied of appliedStockUpdates) {
+        await Barang.findByIdAndUpdate(applied.barang, {
+          $inc: { stok: applied.qty },
+        });
+      }
+      throw err;
+    }
+
+    emitSyncEvent('sync:jual:accepted', {
+      client_transaction_id: client_transaction_id || null,
+      server_transaction_id: jual._id,
+      no_transaksi: jual.no_transaksi,
+      timestamp: new Date().toISOString(),
     });
+    emitBackendStatus();
 
     res.status(201).json(jual);
   } catch (err) {
     if (err.code === 11000) {
-      return res.status(400).json({ error: 'Nomor transaksi sudah digunakan' });
+      return res.status(400).json({ error: 'Client transaction sudah pernah diproses' });
     }
-    res.status(400).json({ error: err.message });
+    const status = err.message?.includes('tidak ditemukan') ? 404 : 400;
+    res.status(status).json({ error: err.message });
   }
 });
 
