@@ -1,0 +1,45 @@
+{
+  "name": "POS - Point of Sale",
+  "short_name": "POS",
+  "id": "/",
+  "description": "Aplikasi Point of Sale offline-ready",
+  "start_url": "/?source=pwa",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "background_color": "#0f172a",
+  "theme_color": "#3b82f6",
+  "orientation": "portrait-primary",
+  "lang": "id-ID",
+  "categories": ["business", "productivity", "shopping"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-maskable.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Data Barang",
+      "short_name": "Barang",
+      "url": "/barang"
+    },
+    {
+      "name": "Transaksi Penjualan",
+      "short_name": "Jual",
+      "url": "/jual"
+    },
+    {
+      "name": "Transaksi Pembelian",
+      "short_name": "Beli",
+      "url": "/beli"
+    }
+  ]
+}
