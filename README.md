@@ -48,7 +48,7 @@ Dibangun untuk mempelajari bagaimana web dapat mengakses folder di komputer peng
 ### Prasyarat
 
 - **Node.js** ≥ 18
-- **MongoDB** (lokal atau [MongoDB Atlas](https://www.mongodb.com/atlas))
+- **MongoDB** (lokal atau [MongoDB Atlas](https://www.mongodb.com/atlas)) *Notes Untuk Database Itu Masing - Masing, cuman saya lebih nyaman ke MongoDB
 - Browser berbasis Chromium (Chrome/Edge) untuk fitur File System Access API
 
 ### 1. Clone & Install
