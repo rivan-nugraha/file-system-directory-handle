@@ -10,8 +10,10 @@ Dibangun untuk mempelajari bagaimana web dapat mengakses folder di komputer peng
 - 📦 **Manajemen Barang** — CRUD data barang (kode, nama, harga beli/jual, stok, kategori)
 - 🛍️ **Transaksi Penjualan** — Input kode manual atau scan barcode kamera, hitung total otomatis
 - 📥 **Transaksi Pembelian** — Catat pembelian dari supplier, update stok & harga beli
-- 📡 **Offline-First** — Aplikasi tetap berfungsi tanpa internet; data disimpan di OPFS / folder lokal
-- 🔄 **Auto-Sync** — Antrean transaksi offline otomatis terkirim saat koneksi kembali
+- 📡 **Offline-First** — Aplikasi tetap berfungsi tanpa internet; data disimpan otomatis
+- 🔄 **Auto-Sync** — Antrean transaksi offline otomatis terkirim saat backend online kembali
+- ⚡ **Optimistic UI** — Hapus & edit langsung tampil di UI tanpa menunggu network
+- 🔒 **Persistent Settings** — Folder kustom & preferensi bertahan meskipun hard refresh (IndexedDB + localStorage)
 - 📱 **PWA** — Dapat di-install sebagai aplikasi desktop/mobile
 - 📷 **Barcode Scanner** — Dukungan kamera untuk scan kode barang (via `html5-qrcode`)
 
@@ -20,25 +22,33 @@ Dibangun untuk mempelajari bagaimana web dapat mengakses folder di komputer peng
 ## 🏗️ Arsitektur
 
 ```
-┌──────────────────────────────────────────────────┐
-│                   Browser                        │
-│  ┌──────────┐   ┌─────────────┐   ┌──────────┐   │
-│  │  React   │──▶│ offlineApi  │──▶│ localFs  │   │
-│  │  (Vite)  │   │  (Axios)    │   │ (OPFS /  │   │
-│  │          │   │             │   │  Folder) │   │
-│  └──────────┘   └──────┬──────┘   └──────────┘   │
-│                        │                         │
-│               Service Worker (PWA)               │
-└────────────────────────┼────────────────────────-┘
+┌────────────────────────────────────────────────────────────────┐
+│                     Browser                                    │
+│  ┌──────────┐   ┌────────────------─┐   ┌───────────────---─┐  │
+│  │  React   │──▶│ offlineApi        │──▶│    localFs        │  │
+│  │  (Vite)  │   │  (Axios)          │   │ ┌─────────---───┐ │  │
+│  │          │   │                   │   │ │ OPFS (default)│ |  │
+│  │          │   │ - GET interceptor │   | │ zero-click    │ |  │
+│  │          │   │ - Write Queue     │   | ├──────────----─┤ │  │
+│  │          │   │ - Auto-Sync       │   | │ Folder      │ │ |  │
+│  │          │   │ - Optimistic UI   │   | │ Kustom      │ │ |  │
+│  └──────────┘   └──────┬──────------┘   │ │ (opsional)  │ │ |  │
+│                        │                | └───────────────┘ │  │
+|                        |                |                   |  |
+│               Service Worker (PWA)      └───────────────────┘  │
+│                        │                  │                    │
+│                        │        IndexedDB (handle)             │
+│                        │        localStorage (mode)            │
+└────────────────────────┼───────────────────────────────────────┘
                          │
-┌────────────────────────┴────────────────────────-┐
-│              Backend (Express)                   │
-│  ┌──────────────────────────────────────────┐    │
-│  │  Routes: /api/barang | /api/jual | /api/beli  │
-│  └──────────────────┬───────────────────────┘    │
-│                     │                            │
-│              MongoDB (Mongoose)                  │
-└──────────────────────────────────────────────────┘
+┌────────────────────────┴──────────────────────────────────┐
+│                  Backend (Express)                        │
+│  ┌──────────────────────────────────────────────────┐     │
+│  │  Routes: /api/barang | /api/jual | /api/beli     │     │
+│  └──────────────────────┬───────────────────────────┘     │
+│                         │                                 │
+│                  MongoDB (Mongoose)                       │
+└───────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -137,149 +147,82 @@ file-system-directory-handle/
 
 ### Offline-First Data Flow
 
-| Kondisi | GET | POST / PUT / DELETE |
-|---------|-----|---------------------|
-| **Online** | Ambil dari server → simpan ke OPFS | Kirim langsung ke server |
-| **Offline** | Ambil dari OPFS / cache lokal | Simpan ke antrean → auto-sync saat online |
+| Operasi | Backend Online | Backend Offline |
+|---------|---------------|-----------------|
+| **GET** | Network-first → cache ke localFs | LocalFs / cache → fallback empty |
+| **POST** | Kirim ke server → reconcile local | Simpan ke localFs + write queue |
+| **PUT** | Kirim ke server → reconcile local | Update localFs + write queue |
+| **DELETE** | Kirim ke server → hapus dari localFs | **Optimistic**: hapus UI & localFs langsung + write queue |
 
-### Storage Offline
+### Write Queue & Auto-Sync
 
-Aplikasi mendukung dua mode penyimpanan:
+```
+Backend offline:
+  POST/PUT/DELETE → localFs (immediate) + write-queue.json (pending)
 
-1. **OPFS** (default) — Storage privat browser, otomatis tersedia
-2. **Folder Kustom** — Pilih folder sendiri via `showDirectoryPicker()` (misal: folder Downloads)
+Backend online:
+  health check → setBackendReachable(true) → syncWriteQueue()
+  ├─ Kirim antrean satu per satu ke server
+  ├─ Sukses → reconcileLocal + hapus dari antrean
+  ├─ Terminal error (400/404/409) → hapus dari antrean, lanjut
+  └─ Network error → stop, coba lagi nanti
 
-Data disimpan dalam file JSON:
+Queue kosong → refreshCoreDataFromServer() → sync semua data
+```
+
+### Storage Offline (Hybrid)
+
+Aplikasi mendukung **dua mode** penyimpanan, dengan prioritas:
+
+```
+resolveHandle()
+  ├─ 1. Folder Kustom (IndexedDB) → 📁 jika user pernah pilih
+  └─ 2. OPFS (default)            → 💾 zero-click, selalu siap
+```
+
+| Mode | Klik? | Persistensi | Keterangan |
+|------|-------|-------------|------------|
+| **OPFS** | ❌ Nol klik | Otomatis | Default — langsung siap saat app dibuka |
+| **Folder Kustom** | ✅ 1× klik | IndexedDB + localStorage | Tahan hard refresh. User bisa lihat file langsung |
+
+Data disimpan dalam file JSON di folder `POS-Offline`:
 - `barang.json` — Master data barang
 - `jual.json` — Riwayat penjualan
 - `beli.json` — Riwayat pembelian
 - `api-cache.json` — Cache response API
-- `write-queue.json` — Antrean transaksi offline
+- `write-queue.json` — Antrean operasi tertunda
 
 ---
 
-## � Cara Mengaktifkan OPFS di Frontend
+## 💾 Storage: OPFS + File System Access
 
-OPFS (**Origin Private File System**) adalah storage privat yang disediakan browser untuk setiap origin (domain).  
-Data disimpan di filesystem lokal dan **tidak bisa diakses oleh origin lain**.
+### OPFS (Default — Zero-Click)
 
-### Syarat OPFS
+**Origin Private File System** — storage privat browser yang selalu tersedia tanpa izin user.
 
 | Syarat | Keterangan |
 |--------|------------|
-| **Secure Context** | Halaman harus diakses via `https://` atau `localhost` |
+| **Secure Context** | `https://` atau `localhost` |
 | **Browser Chromium** | Chrome 86+, Edge 86+, Opera 72+ |
-| **`navigator.storage.getDirectory()`** | API harus tersedia di browser |
+| **API** | `navigator.storage.getDirectory()` |
 
-> ⚠️ **Firefox & Safari** tidak mendukung OPFS. Gunakan fallback **Folder Kustom** (File System Access API) atau IndexedDB sebagai alternatif.
+> ⚠️ **Firefox & Safari** tidak mendukung OPFS.
 
-### Cara Kerja `localFs.js`
+### Folder Kustom (Opsional)
 
-File `frontend/src/localFs.js` menangani semua logika penyimpanan offline. Berikut arsitektur internalnya:
-
-```
-┌─────────────────────────────────────────────────────┐
-│                    localFs.js                       │
-│                                                     │
-│  resolveHandle()                                    │
-│  ├── Cek folder kustom (user pilih manual)          │
-│  └── Fallback ke OPFS (navigator.storage.getDir)    │
-│                                                     │
-│  saveCollection() / loadCollection()                │
-│  ├── writeJson() → fileHandle.createWritable()      │
-│  └── readJson()  → fileHandle.getFile()             │
-│                                                     │
-│  API Cache:  cacheApiResponse() / getCachedApiResp()│
-│  Write Queue: addToWriteQueue() / getWriteQueue()   │
-└─────────────────────────────────────────────────────┘
-```
-
-### Langkah Demi Langkah
-
-#### 1. Pastikan Secure Context
-
-Di `vite.config.js`, frontend sudah dijalankan di `localhost` (secure context otomatis):
-
-```js
-// frontend/vite.config.js
-export default defineConfig({
-  server: {
-    port: 5173,
-    strictPort: true,
-    proxy: { '/api': 'http://localhost:8000' },
-  },
-})
-```
-
-#### 2. Cek Dukungan OPFS
-
-Fungsi `isOpfsSupported()` di `localFs.js` mengecek apakah API tersedia:
-
-```js
-// frontend/src/localFs.js
-export function isOpfsSupported() {
-  return 'storage' in navigator && typeof navigator.storage.getDirectory === 'function';
-}
-```
-
-#### 3. Minta Persistensi Storage
-
-Agar data tidak dihapus otomatis oleh browser saat ruang penyimpanan penuh:
-
-```js
-// frontend/src/localFs.js — dalam requestOpfsAccess()
-if (navigator.storage && typeof navigator.storage.persist === 'function') {
-  await navigator.storage.persist(); // Minta persistent storage
-}
-```
-
-#### 4. Buat Folder Aplikasi di OPFS
-
-```js
-// frontend/src/localFs.js
-const root = await navigator.storage.getDirectory();        // Root OPFS
-const appDir = await root.getDirectoryHandle('POS-Offline', { create: true }); // Folder app
-```
-
-#### 5. Baca & Tulis File JSON
-
-```js
-// Menulis data
-const fileHandle = await appDir.getFileHandle('barang.json', { create: true });
-const writable = await fileHandle.createWritable();
-await writable.write(JSON.stringify(data, null, 2));
-await writable.close();
-
-// Membaca data
-const fileHandle = await appDir.getFileHandle('barang.json', { create: false });
-const file = await fileHandle.getFile();
-const text = await file.text();
-const data = JSON.parse(text);
-```
-
-#### 6. Mode Ganda: OPFS atau Folder Kustom
-
-User bisa memilih mode penyimpanan melalui UI sidebar:
+User bisa memilih folder sendiri via `showDirectoryPicker()` — file bisa dilihat langsung di file manager.
 
 | Tombol | Fungsi |
 |--------|--------|
-| **Aktifkan OPFS** | Request persistent storage + buat folder `POS-Offline` di OPFS |
-| **Pakai OPFS** | Kembali ke OPFS setelah pakai folder kustom |
-| **Pilih Folder Download** | Buka `showDirectoryPicker()` — user pilih folder sendiri |
+| **📁 Pilih Folder Kustom** | Buka dialog pilih folder (default: Downloads) |
+| **💾 Kembali ke OPFS** | Switch balik ke OPFS |
+| **🗑️ Hapus Semua Data Lokal** | Reset total — hapus semua data dari OPFS & folder kustom |
 
-```js
-// Contoh: user pilih folder sendiri
-const handle = await window.showDirectoryPicker({
-  id: 'pos-custom',
-  mode: 'readwrite',
-  startIn: 'downloads',
-});
-```
+**Setting bertahan permanen** — mode & handle folder disimpan di `localStorage` + `IndexedDB`, tidak hilang meskipun hard refresh.
 
-#### 7. Verifikasi di DevTools
+### Verifikasi di DevTools
 
-Buka **Chrome DevTools** → **Application** → **Storage** → **Origin Private File System**  
-Anda akan melihat folder `POS-Offline` dengan file-file JSON di dalamnya.
+**Chrome DevTools** → **Application** → **Origin Private File System**:
 
 ```
 Origin Private File System
@@ -291,37 +234,19 @@ Origin Private File System
     └── write-queue.json
 ```
 
-### Integrasi dengan `offlineApi.js`
-
-File `offlineApi.js` menggunakan `localFs.js` melalui fungsi-fungsi ini:
-
-```js
-// frontend/src/offlineApi.js
-import {
-  saveBarang, loadBarang,     // Koleksi barang
-  saveJual,   loadJual,       // Koleksi penjualan
-  saveBeli,   loadBeli,       // Koleksi pembelian
-  cacheApiResponse,           // Cache GET response
-  getCachedApiResponse,       // Ambil cache
-  addToWriteQueue,            // Antrean operasi tulis offline
-  getWriteQueue,              // Baca antrean
-  removeFromWriteQueue,       // Hapus dari antrean
-  getQueueCount,              // Jumlah antrean
-} from './localFs';
-```
-
-> 💡 **Tidak perlu install package tambahan.** OPFS adalah Web API bawaan browser — `localFs.js` langsung menggunakan `navigator.storage.getDirectory()` tanpa library eksternal.
+> 💡 **Tidak perlu package tambahan.** OPFS & File System Access adalah Web API bawaan browser.
 
 ---
 
-## �🛠️ Tech Stack
+## 🛠️ Tech Stack
 
 | Layer | Teknologi |
 |-------|-----------|
 | Frontend | React 18, Vite, React Router 6, Axios |
 | Backend | Node.js, Express, Mongoose |
 | Database | MongoDB |
-| Offline Storage | OPFS, File System Access API |
+| Offline Storage | OPFS (default), File System Access API (opsional) |
+| Persistence | IndexedDB, localStorage |
 | Scanner | html5-qrcode |
 | PWA | Service Worker, Web App Manifest |
 
