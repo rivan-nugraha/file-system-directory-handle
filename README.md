@@ -22,19 +22,19 @@ Dibangun untuk mempelajari bagaimana web dapat mengakses folder di komputer peng
 ```
 ┌──────────────────────────────────────────────────┐
 │                   Browser                        │
-│  ┌──────────┐   ┌─────────────┐   ┌──────────┐  │
-│  │  React   │──▶│ offlineApi  │──▶│ localFs  │  │
-│  │  (Vite)  │   │  (Axios)    │   │ (OPFS /  │  │
-│  │          │   │             │   │  Folder)  │  │
-│  └──────────┘   └──────┬──────┘   └──────────┘  │
+│  ┌──────────┐   ┌─────────────┐   ┌──────────┐   │
+│  │  React   │──▶│ offlineApi  │──▶│ localFs  │   │
+│  │  (Vite)  │   │  (Axios)    │   │ (OPFS /  │   │
+│  │          │   │             │   │  Folder) │   │
+│  └──────────┘   └──────┬──────┘   └──────────┘   │
 │                        │                         │
 │               Service Worker (PWA)               │
-└────────────────────────┼────────────────────────┘
+└────────────────────────┼────────────────────────-┘
                          │
-┌────────────────────────┴────────────────────────┐
+┌────────────────────────┴────────────────────────-┐
 │              Backend (Express)                   │
 │  ┌──────────────────────────────────────────┐    │
-│  │  Routes: /api/barang | /api/jual | /api/beli │
+│  │  Routes: /api/barang | /api/jual | /api/beli  │
 │  └──────────────────┬───────────────────────┘    │
 │                     │                            │
 │              MongoDB (Mongoose)                  │
@@ -179,16 +179,16 @@ File `frontend/src/localFs.js` menangani semua logika penyimpanan offline. Berik
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    localFs.js                        │
-│                                                      │
-│  resolveHandle()                                     │
-│  ├── Cek folder kustom (user pilih manual)           │
+│                    localFs.js                       │
+│                                                     │
+│  resolveHandle()                                    │
+│  ├── Cek folder kustom (user pilih manual)          │
 │  └── Fallback ke OPFS (navigator.storage.getDir)    │
-│                                                      │
-│  saveCollection() / loadCollection()                 │
+│                                                     │
+│  saveCollection() / loadCollection()                │
 │  ├── writeJson() → fileHandle.createWritable()      │
 │  └── readJson()  → fileHandle.getFile()             │
-│                                                      │
+│                                                     │
 │  API Cache:  cacheApiResponse() / getCachedApiResp()│
 │  Write Queue: addToWriteQueue() / getWriteQueue()   │
 └─────────────────────────────────────────────────────┘
