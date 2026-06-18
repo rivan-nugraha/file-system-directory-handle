@@ -23,7 +23,14 @@ import {
   loadBeli,
 } from './localFs';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
+// Auto-detect backend URL:
+// - Vite dev → '/api' (proxy ke localhost:8000)
+// - Electron production → 'http://localhost:8000/api'
+// - Capacitor/Web production → VITE_API_BASE_URL atau localhost
+const API_BASE = import.meta.env.VITE_API_BASE_URL
+  || (window.electronAPI?.isElectron && !import.meta.env.DEV
+    ? 'http://localhost:8000/api'
+    : '/api');
 
 const api = axios.create({ baseURL: API_BASE });
 

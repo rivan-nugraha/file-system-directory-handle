@@ -2,7 +2,8 @@ import { NavLink, Outlet } from 'react-router-dom';
 import { useState, useEffect } from 'react';
 import api, { onOnlineChange, onQueueChange, setBackendReachable, syncWriteQueue } from '../offlineApi';
 import { subscribeBackendSocket } from '../backendSocket';
-import { getStorageInfo, onStorageChange, pickFolder, initStorage, clearStorage, useOpfsStorage, deleteAllLocalData } from '../localFs';
+import { getStorageInfo, onStorageChange, pickFolder, initStorage, useOpfsStorage, deleteAllLocalData } from '../localFs';
+import { getOfflineReadyInfo, prepareOfflineMode, resetOfflineReadyFlag } from '../offlinePrep';
 
 export default function Layout() {
   const [dbStatus, setDbStatus] = useState(null);
@@ -24,6 +25,12 @@ export default function Layout() {
     window.matchMedia?.('(display-mode: standalone)')?.matches || false
   );
   const [socketConnected, setSocketConnected] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState(null); // null | 'available' | 'downloaded' | 'error'
+  const [appVersion] = useState(
+    window.electronAPI?.version || import.meta.env.PACKAGE_VERSION || '0.1.0'
+  );
+  const [offlineReady, setOfflineReady] = useState(getOfflineReadyInfo().ready);
+  const [preparingOffline, setPreparingOffline] = useState(false);
 
   useEffect(() => {
     const unsub = onOnlineChange(setIsOnline);
@@ -75,6 +82,15 @@ export default function Layout() {
   useEffect(() => {
     const unsub = onQueueChange(setQueueCount);
     return unsub;
+  }, []);
+
+  // Listen update status dari Electron
+  useEffect(() => {
+    if (window.electronAPI?.onUpdateStatus) {
+      window.electronAPI.onUpdateStatus((status) => {
+        setUpdateStatus(status);
+      });
+    }
   }, []);
 
   useEffect(() => {
@@ -129,6 +145,7 @@ export default function Layout() {
   const handleDeleteAllData = async () => {
     if (!confirm('HAPUS SEMUA DATA LOKAL?\n\nData barang, penjualan, pembelian, dan cache akan dihapus permanen.\n\nData di server (MongoDB) tidak terpengaruh.')) return;
     await deleteAllLocalData();
+    resetOfflineReadyFlag();
     location.reload();
   };
 
@@ -144,6 +161,20 @@ export default function Layout() {
     }
   };
 
+  const handlePrepareOffline = async () => {
+    setStorageError('');
+    setPreparingOffline(true);
+    try {
+      await prepareOfflineMode();
+      setOfflineReady(true);
+    } catch (err) {
+      setStorageError(err.message || 'Gagal menyiapkan mode offline.');
+      setOfflineReady(false);
+    } finally {
+      setPreparingOffline(false);
+    }
+  };
+
   const linkClass = ({ isActive }) =>
     `nav-link ${isActive ? 'active' : ''}`;
 
@@ -152,6 +183,9 @@ export default function Layout() {
       <aside className="sidebar">
         <div className="sidebar-brand">
           <h2>🛒 POS</h2>
+          <span style={{ fontSize: '0.7rem', color: '#64748b', display: 'block', marginBottom: '0.3rem' }}>
+            v{appVersion}
+          </span>
           <span className={`badge ${isOnline && dbStatus === 'connected' ? 'badge-green' : 'badge-red'}`}>
             {!isOnline
               ? '⚡ Browser Offline'
@@ -159,6 +193,21 @@ export default function Layout() {
                 ? '● Backend Online'
                 : '○ Backend Offline'}
           </span>
+          {updateStatus === 'downloaded' && (
+            <span
+              className="badge badge-green"
+              style={{ cursor: 'pointer', marginTop: '0.3rem', display: 'block' }}
+              onClick={() => window.electronAPI?.installUpdate()}
+              title="Klik untuk restart & install update"
+            >
+              🔄 Update siap — klik restart
+            </span>
+          )}
+          {updateStatus === 'available' && (
+            <span className="badge" style={{ background: '#1e3a5f', color: '#93c5fd', marginTop: '0.3rem', display: 'block' }}>
+              ⬇ Mendownload update...
+            </span>
+          )}
         </div>
 
         <nav className="sidebar-nav">
@@ -184,6 +233,21 @@ export default function Layout() {
             </button>
           ) : null}
 
+          {offlineReady ? (
+            <div className="folder-status" style={{ marginBottom: '0.75rem' }}>
+              <span>✅ App siap offline</span>
+            </div>
+          ) : (
+            <button
+              className="btn btn-primary folder-btn"
+              style={{ marginBottom: '0.75rem' }}
+              onClick={handlePrepareOffline}
+              disabled={preparingOffline || !isOnline || dbStatus !== 'connected'}
+            >
+              {preparingOffline ? 'Menyiapkan Offline...' : '⚙️ Siapkan Offline'}
+            </button>
+          )}
+
           <button className="btn btn-outline folder-btn" onClick={handlePickFolder}>
             {storageInfo.customSelected ? '📁 Ganti Folder' : '📁 Pilih Folder Kustom'}
           </button>
@@ -204,6 +268,18 @@ export default function Layout() {
             🗑️ Hapus Semua Data Lokal
           </button>
 
+          <button
+            className="btn btn-primary folder-btn"
+            style={{ marginTop: '0.5rem' }}
+            onClick={() => {
+              // Arahkan ke GitHub Releases (selalu tersedia semua platform)
+              const releaseUrl = 'https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/releases/latest';
+              window.open(releaseUrl, '_blank');
+            }}
+          >
+            💻 Download Desktop App
+          </button>
+
           <div className="folder-status" style={{ marginTop: '0.5rem' }}>
             <span>{storageInfo.ready ? '✅' : '⚠️'} {storageInfo.label}</span>
             {storageInfo.customSelected && (
@@ -222,6 +298,12 @@ export default function Layout() {
           <p className="text-muted" style={{ marginTop: '0.25rem', fontSize: '0.75rem' }}>
             {socketConnected ? '🟢 Socket realtime terhubung' : '🔴 Socket realtime terputus'}
           </p>
+
+          {!offlineReady ? (
+            <p className="text-muted" style={{ marginTop: '0.25rem', fontSize: '0.75rem' }}>
+              Offline first-run aman setelah `Siapkan Offline` selesai.
+            </p>
+          ) : null}
 
           {storageError ? (
             <p className="text-muted" style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: '#fca5a5' }}>

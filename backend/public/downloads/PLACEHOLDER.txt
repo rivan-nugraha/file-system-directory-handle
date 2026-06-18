@@ -1,0 +1,1 @@
+Placeholder — ganti dengan hasil build Electron (npm run electron:build)

@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  base: './',  // Relative path — untuk Electron & Capacitor
   server: {
     port: 5173,
     strictPort: true,
@@ -18,5 +19,8 @@ export default defineConfig({
       host: 'localhost',
       port: 5173,
     },
+  },
+  build: {
+    outDir: 'dist',
   },
 })
