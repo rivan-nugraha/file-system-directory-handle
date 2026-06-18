@@ -1,2 +1,11 @@
-./backend/node_modules
-./frontend/node_modules
+backend/node_modules/
+frontend/node_modules/
+
+# Build outputs
+frontend/dist/
+frontend/release/
+frontend/android/
+frontend/ios/
+
+file-system-directory-handle-production/
+file-system-directory-handle-api-production/
